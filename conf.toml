@@ -1,0 +1,9 @@
+
+url = "https://localhost/events/restSearch"
+content_type = "application/json"
+
+#misp api key
+authorization = ""
+return_format = "json"
+
+

@@ -1,14 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/spf13/viper"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"strings"
 )
+
+const arLogFile = "active-responses.log"
+
+//const arLogFile = "/var/ossec/logs/active-responses.log"
 
 type WazuhResult struct {
 	Matched bool      `json:"matched"`
@@ -59,6 +68,7 @@ func getMispObject(name string, event *MispEvent) (*MispObject, bool) {
 	return nil, false
 }
 
+// filter the wanted fields from the MispObject
 func extractMispObjectInfo(m *MispObject, filter map[string]bool, c chan<- map[string]string) {
 
 	//check if filter is not empty, if so set a flag
@@ -83,6 +93,7 @@ func extractMispObjectInfo(m *MispObject, filter map[string]bool, c chan<- map[s
 
 }
 
+// generate a minimal response containing information about the matched indicator.
 func generateWazuhResponse(m *MispResult) (map[string]any, error) {
 
 	var wazuhResponse map[string]any = make(map[string]any)
@@ -147,23 +158,48 @@ func findValue(key string, attributes []MispAttribute) string {
 
 }
 
-func main() {
+// extract the just added file name from the given log line
+func extractFileName(s string) (string, bool) {
 
-	// word to search for
-	filename := "pafish.exe"
+	var tmp string = strings.ReplaceAll(s, "\n", " ")
 
-	url := "https://localhost/events/restSearch"
+	startIndex := strings.LastIndex(tmp, "\\")
+	if startIndex == -1 {
+		return "", false
+	}
+	startIndex++
+
+	endIndex := strings.LastIndex(tmp[startIndex:], "'")
+	if endIndex == -1 {
+		return "", false
+	}
+	endIndex += startIndex
+
+	return tmp[startIndex:endIndex], true
+
+}
+
+type RequestConf struct {
+	Url           string `mapstructure:"url"`
+	ContentType   string `mapstructure:"content_type"`
+	Authorization string `mapstructure:"authorization"`
+	ReturnFormat  string `mapstructure:"return_format"`
+}
+
+func mispSearchRequest(filename string, requestConf *RequestConf) ([]byte, error) {
+
+	url := requestConf.Url
 
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
-	contentType := "application/json"
-	authorization := "1E2kB3EwEd1XTw7u25yuh8ALsKZseTXJ2StErfmk"
+	contentType := requestConf.ContentType
+	authorization := requestConf.Authorization
 
 	// build query string
 	var queryString map[string]interface{} = make(map[string]interface{})
 
 	queryString["searchall"] = filename
-	queryString["returnFormat"] = "json"
+	queryString["returnFormat"] = requestConf.ReturnFormat
 
 	b, err := json.Marshal(queryString)
 	if err != nil {
@@ -174,7 +210,7 @@ func main() {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(b))
 	if err != nil {
 		fmt.Println(err)
-		return
+		return []byte(""), err
 	}
 	// add required headers
 	req.Header.Add("Content-Type", contentType)
@@ -183,22 +219,71 @@ func main() {
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Println(err)
-		return
+		return []byte(""), err
+
 	}
 	defer resp.Body.Close()
 
 	//read response
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		return []byte(""), err
+	}
+
+	return body, nil
+
+}
+
+func main() {
+
+	f, err := os.OpenFile(arLogFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0660)
+
+	if err != nil {
+		log.Fatalf("Error opening log file: %v", err)
+	}
+	defer f.Close()
+
+	log.SetOutput(f)
+	log.Print("match-indicator started")
+
+	//read config file into struct
+	var reqConf RequestConf
+	if err = readConfig(&reqConf); err != nil {
+		panic(err)
+	}
+
+	//parse the json input passed by wazuh
+	fullLog, err := readWazuhInput()
+	//fullLog := "File 'c:\\windows\\system32\\sru\\srudb.dat' added Mode: scheduled"
+
+	if err != nil {
+		panic(err)
+	}
+	log.Print("DEBUG| successfully parsed wazuh input")
+
+	// extract the filename contained in the wazuh log
+	filename, ok := extractFileName(fullLog)
+	if !ok {
+		log.Print("extract filename failed")
+		return
+	}
+	log.Printf("filename found: %v", filename)
+
+	// filename = "pafish.exe"
+	body, err := mispSearchRequest(filename, &reqConf)
+	if err != nil {
+		log.Printf("ERROR | misp request failed: %v", err)
 		panic(err)
 	}
 
 	// fmt.Println(string(body))
 
 	var result MispResult
-	err = json.Unmarshal(body, &result)
-	if err != nil {
+	if err = json.Unmarshal(body, &result); err != nil {
 		panic(err)
+	} else if result.Response == nil || len(result.Response) == 0 {
+		log.Printf("no matching attribute found for the given filename")
+		return
 	}
 
 	// create a new object which is going to be marshaled and sent back to wazuh
@@ -212,7 +297,64 @@ func main() {
 		panic(err)
 	}
 
-	//send data back
 	fmt.Println(string(data))
+
+}
+
+// read json from stdin
+func readInput() string {
+
+	var line string
+	s := bufio.NewScanner(os.Stdin)
+	s.Scan()
+
+	line = s.Text()
+
+	return line
+
+}
+
+// read config file into the given struct
+func readConfig(conf *RequestConf) error {
+
+	viper.SetConfigName("conf")
+	viper.SetConfigType("toml")
+
+	viper.AddConfigPath("$HOME/go_misp")
+
+	err := viper.ReadInConfig()
+	if err != nil {
+		log.Printf("ERROR | error while reading config file: %v", err)
+		return err
+	}
+	log.Printf("DEBUG | successfully read config file")
+
+	if err := viper.Unmarshal(conf); err != nil {
+		log.Printf("ERROR | error while unmarshaling config: %v", err)
+		return err
+	}
+	log.Printf("DEBUG | successfully unmarshaled config")
+	return nil
+
+}
+
+func readWazuhInput() (string, error) {
+
+	//read input from stdin
+	jsonInput := readInput()
+	log.Printf("DEBUG | jsonInput: %v", jsonInput)
+
+	//unmarshal it into a map
+	var alertContent *map[string]any
+	alertContent, err := ParseWazuhArg(&jsonInput)
+
+	if err != nil {
+		log.Printf("error during ParseWazuhArg: %v", err)
+		return "", err
+	}
+
+	//now extract the full_log field
+	var fullLog string = (*alertContent)["full_log"].(string)
+	return fullLog, nil
 
 }
